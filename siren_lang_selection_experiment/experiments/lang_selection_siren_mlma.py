@@ -91,6 +91,7 @@ LANG_ALIASES = {
     "en": "en", "eng": "en", "english": "en",
     "ko": "ko", "kor": "ko", "korean": "ko", "kr": "ko",
     "fr": "fr", "fra": "fr", "fre": "fr", "french": "fr",
+    "ar": "ar", "ara": "ar", "arabic": "ar",
 }
 
 DEFAULT_UNSAFE_LABELS = {
@@ -99,7 +100,7 @@ DEFAULT_UNSAFE_LABELS = {
 }
 
 TEXT_COLUMN_CANDIDATES = ["text", "tweet", "comment", "sentence", "content", "body"]
-LABEL_COLUMN_CANDIDATES = ["label", "labels", "class", "category", "annotation", "hate", "hateful"]
+LABEL_COLUMN_CANDIDATES = ["label", "labels", "class", "category", "annotation", "hate", "hateful", "sentiment"]
 LANG_COLUMN_CANDIDATES = ["lang", "language", "locale"]
 
 
@@ -158,8 +159,18 @@ def auto_column(columns: Sequence[str], candidates: Sequence[str], explicit: Opt
     raise ValueError(f"Could not auto-detect {kind} column. Available columns: {columns}")
 
 
-def normalize_label(value: Any, unsafe_labels: set[str]) -> int:
-    """Map MLMA-style labels to binary 0=safe/non-hate, 1=unsafe/hate."""
+def normalize_label(value: Any, unsafe_labels: set[str], normal_label: Optional[str] = None) -> int:
+    """Map MLMA-style labels to binary 0=safe/non-hate, 1=unsafe/hate.
+
+    Two binarization modes:
+    - ``normal_label`` mode (recommended for MLMA): any value that is NOT
+      exactly equal to ``normal_label`` is treated as unsafe (1).  This
+      correctly handles compound labels such as "offensive_disrespectful",
+      "hateful_normal", "disrespectful", "fearful", etc., all of which the
+      MLMA paper considers toxic.  Use ``--normal_label normal``.
+    - ``unsafe_set`` mode (default): a value is unsafe iff it appears in
+      ``unsafe_labels``.  Suitable for datasets with clean binary string labels.
+    """
     if value is None:
         raise ValueError("Label is None")
     if isinstance(value, (int, np.integer)):
@@ -169,10 +180,44 @@ def normalize_label(value: Any, unsafe_labels: set[str]) -> int:
             raise ValueError("Label is NaN")
         return int(float(value) > 0.0)
     if isinstance(value, (list, tuple, np.ndarray)):
-        # Multi-label case: any positive / unsafe-like label means unsafe.
-        return int(any(normalize_label(v, unsafe_labels) == 1 for v in value))
+        # Multi-label case: any positive / unsafe-like element means unsafe.
+        return int(any(normalize_label(v, unsafe_labels, normal_label) == 1 for v in value))
     s = str(value).strip().lower()
+    if normal_label is not None:
+        # MLMA rule: exactly the safe label → 0, everything else → 1.
+        return 0 if s == normal_label else 1
     return int(s in unsafe_labels)
+
+
+import re as _re
+_AR_SCRIPT = _re.compile(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]')
+
+
+def infer_language(text: str, candidates: Sequence[str]) -> Optional[str]:
+    """Heuristically detect the language of *text* and return a normalized code.
+
+    Strategy (ordered by reliability):
+    1. Arabic-script character detection — fast, near-perfect for Arabic.
+    2. ``langdetect`` fallback — covers Latin-script language pairs like
+       French vs English.  Requires ``pip install langdetect``.
+
+    Returns the normalized language code (via :func:`normalize_lang`) if it
+    is in *candidates*, otherwise ``None``.
+    """
+    if "ar" in candidates and _AR_SCRIPT.search(text):
+        return "ar"
+    try:
+        from langdetect import detect, LangDetectException
+        try:
+            detected = normalize_lang(detect(text))
+            return detected if detected in candidates else None
+        except LangDetectException:
+            return None
+    except ImportError:
+        raise ImportError(
+            "langdetect is required for --infer_language.  "
+            "Install it with: pip install langdetect"
+        )
 
 
 def load_mlma_records(args: argparse.Namespace) -> List[Dict[str, Any]]:
@@ -197,28 +242,67 @@ def load_mlma_records(args: argparse.Namespace) -> List[Dict[str, Any]]:
     columns = list(ds.column_names)
     text_col = auto_column(columns, TEXT_COLUMN_CANDIDATES, args.text_column, "text")
     label_col = auto_column(columns, LABEL_COLUMN_CANDIDATES, args.label_column, "label")
-    lang_col = auto_column(columns, LANG_COLUMN_CANDIDATES, args.language_column, "language")
+
+    # Language column: optional when --infer_language is set.
+    has_lang_col = True
+    try:
+        lang_col = auto_column(columns, LANG_COLUMN_CANDIDATES, args.language_column, "language")
+    except ValueError:
+        if not args.infer_language:
+            raise ValueError(
+                "No language column found in the dataset and --infer_language is not set. "
+                "For nedjmaou/MLMA_hate_speech (which has no language column), add "
+                "--infer_language to the command.  Alternatively, pass --language_column "
+                "with the correct column name if your dataset has one."
+            )
+        lang_col = None
+        has_lang_col = False
+
     unsafe_labels = {x.strip().lower() for x in args.unsafe_labels.split(",") if x.strip()}
+    normal_label = args.normal_label.strip().lower() if args.normal_label else None
 
     wanted_langs = [normalize_lang(x) for x in args.languages]
     wanted_langs = [x for x in wanted_langs if x is not None]
 
+    skipped_lang = 0
     records = []
     for row in ds:
-        lang = normalize_lang(row.get(lang_col))
+        # ── Language ──────────────────────────────────────────────────────────
+        if has_lang_col:
+            lang = normalize_lang(row.get(lang_col))
+        else:
+            text_raw = str(row.get(text_col, "")).strip()
+            lang = infer_language(text_raw, wanted_langs)
         if lang not in wanted_langs:
+            skipped_lang += 1
             continue
+
+        # ── Text ──────────────────────────────────────────────────────────────
         text = str(row.get(text_col, "")).strip()
         if not text:
             continue
+
+        # ── Label ─────────────────────────────────────────────────────────────
         try:
-            label = normalize_label(row.get(label_col), unsafe_labels)
+            label = normalize_label(row.get(label_col), unsafe_labels, normal_label)
         except Exception:
             continue
+
         records.append({"text": text, "label": int(label), "lang": lang})
 
+    if skipped_lang and not has_lang_col:
+        print(
+            f"[warn] infer_language: {skipped_lang} rows dropped "
+            f"(detected language not in {wanted_langs} or detection failed)."
+        )
     if not records:
-        raise ValueError("No records left after filtering. Check columns, language values, and labels.")
+        raise ValueError(
+            "No records left after filtering.  "
+            "Check --languages, --text_column, --label_column.  "
+            "If using nedjmaou/MLMA_hate_speech, make sure you set "
+            "--languages en fr ar --label_column sentiment --normal_label normal "
+            "--infer_language."
+        )
     return records
 
 
@@ -1218,7 +1302,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label_column", type=str, default=None)
     parser.add_argument("--language_column", type=str, default=None)
     parser.add_argument("--unsafe_labels", type=str, default=",".join(sorted(DEFAULT_UNSAFE_LABELS)))
-    parser.add_argument("--languages", type=str, nargs="+", default=["en", "ko", "fr"])
+    parser.add_argument(
+        "--normal_label",
+        type=str,
+        default=None,
+        help=(
+            "If set, the binarization rule becomes: 0 if label == normal_label else 1. "
+            "Use --normal_label normal for nedjmaou/MLMA_hate_speech, which has compound "
+            "labels like 'offensive_disrespectful' and 'hateful_normal' that are all toxic "
+            "but would be missed by the default unsafe_labels set."
+        ),
+    )
+    parser.add_argument("--languages", type=str, nargs="+", default=["en", "fr", "ar"])
+    parser.add_argument(
+        "--infer_language",
+        action="store_true",
+        help=(
+            "Detect the language of each row when the dataset has no language column. "
+            "Required for nedjmaou/MLMA_hate_speech.  Uses Arabic-script detection for "
+            "Arabic and langdetect for other languages (pip install langdetect)."
+        ),
+    )
     parser.add_argument("--max_per_lang", type=int, default=0)
     parser.add_argument("--train_ratio", type=float, default=0.70)
     parser.add_argument("--val_ratio", type=float, default=0.15)

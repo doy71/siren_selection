@@ -2,20 +2,32 @@
 set -euo pipefail
 
 # Run this from the root of CSSLab/SIREN or doy71/real_siren-compatible repo.
-# Edit MLMA_DATASET and column names to match the exact MLMA source you used before.
+#
+# Dataset: nedjmaou/MLMA_hate_speech (Arabic / French / English)
+#
+# Key differences from a generic MLMA-style invocation:
+#   --languages en fr ar       MLMA has Arabic, French, English (NOT Korean)
+#   --label_column sentiment   Actual column name in the HF dataset
+#   --normal_label normal      MLMA binarization rule: normal→0, everything else→1
+#                              (handles compound labels like offensive_disrespectful,
+#                              hateful_normal, fearful, disrespectful, etc.)
+#   --infer_language           nedjmaou/MLMA_hate_speech has NO language column;
+#                              uses Arabic-script detection + langdetect fallback
+#
+# Prerequisite: pip install langdetect
 
 MODEL=${MODEL:-qwen3-4b}
-MLMA_DATASET=${MLMA_DATASET:-"YOUR_MLMA_HF_DATASET_ID"}
 OUT=${OUT:-"outputs/mlma_lang_selection_${MODEL}"}
 
 python experiments/lang_selection_siren_mlma.py \
   --model "$MODEL" \
-  --hf_dataset "$MLMA_DATASET" \
+  --hf_dataset "nedjmaou/MLMA_hate_speech" \
   --hf_split train \
-  --text_column text \
-  --label_column label \
-  --language_column language \
-  --languages en ko fr \
+  --text_column tweet \
+  --label_column sentiment \
+  --normal_label normal \
+  --languages en fr ar \
+  --infer_language \
   --pooling_types residual_mean \
   --max_per_lang 1000 \
   --extract_batch_size 16 \
