@@ -4,13 +4,12 @@ This experiment keeps the official SIREN pipeline but changes the **neuron selec
 
 ## What it compares
 
-For each strategy below, the script builds selected-neuron masks, aggregates selected internal dimensions across layers with validation-performance layer weights, then trains a new MLP SIREN classifier on the same pooled EN+KO+FR training data.
+For each strategy below, the script builds selected-neuron masks, aggregates selected internal dimensions across layers with validation-performance layer weights, then trains a new MLP SIREN classifier on the same pooled multilingual training data.
 
-- `en_selected`: nonzero neurons from English L1 probes
-- `ko_selected`: nonzero neurons from Korean L1 probes
-- `fr_selected`: nonzero neurons from French L1 probes
-- `pooled_selected`: nonzero neurons from EN+KO+FR pooled L1 probes
-- `shared_only`: neurons stably nonzero in EN, KO, and FR probes
+- `en_selected`: official cumulative-importance-selected neurons from English L1 probes
+- `<lang>_selected`: official cumulative-importance-selected neurons from each language's L1 probes
+- `pooled_selected`: official cumulative-importance-selected neurons from pooled multilingual L1 probes
+- `shared_only`: neurons stably selected across all language-specific probes
 - `shared_plus_all_specific`: union of shared neurons and all language-specific neurons
 - `routed_shared_specific`: shared block + language-routed specific blocks; requires language id
 - `random_same_size_as_pooled`: random baseline with the same per-layer selected count as pooled selection
@@ -62,6 +61,7 @@ python experiments/lang_selection_siren_mlma.py \
   --pooling_types residual_mean \
   --max_per_lang 1000 \
   --seeds 1 2 3 \
+  --saliency_thresholds 0.6 0.8 \
   --output_dir outputs/mlma_lang_selection_qwen
 ```
 
@@ -84,11 +84,13 @@ Inside `output_dir`:
 
 - `representations.pkl`: cached internal representations
 - `probe_runs.pkl`: cached L1 probe results
-- `<pooling_type>/selection_summary.csv`: selected neuron counts per strategy/layer
-- `<pooling_type>/overlap_summary.csv`: observed vs expected-random overlap
-- `<pooling_type>/classifier_results.csv`: main comparison table
-- `<pooling_type>/classifier_results.json`: full metrics
-- `<pooling_type>/models/*.pt`: saved classifier heads if `--save_models` is set
+- `<pooling_type>/saliency_0p60/selection_summary.csv`: selected neuron counts per strategy/layer
+- `<pooling_type>/saliency_0p60/overlap_summary.csv`: observed vs exact expected-random overlap
+- `<pooling_type>/saliency_0p60/classifier_results.csv`: main comparison table
+- `<pooling_type>/saliency_0p60/classifier_results.json`: full metrics
+- `<pooling_type>/saliency_0p60/models/*.pt`: saved classifier heads if `--save_models` is set
+
+The same structure is created for each value in `--saliency_thresholds`, e.g. `saliency_0p60` and `saliency_0p80`.
 
 ## Main metrics to report
 
@@ -108,7 +110,27 @@ Interpretation:
 
 ## Important notes
 
-- `nonzero` selection is maintained by default as `abs(weight) > --nonzero_eps`.
-- Stability comes from repeated seeds: a dimension is stable if its nonzero frequency is `>= --stability_tau`.
-- Language-specific dimensions are selected when a dimension is stable in one language and below `--specific_tau_low` in the others.
+- Final neuron selection follows the official SIREN cumulative-importance rule, not exact nonzero weights: sort dimensions by `abs(weight)` and keep the smallest prefix whose cumulative importance reaches `--saliency_thresholds`.
+- `--nonzero_eps` is now only a diagnostic count for approximate nonzero probe weights; it is not used as the selected-neuron mask.
+- Stability comes from repeated seeds: a dimension is stable if its cumulative-selection frequency is `>= --stability_tau`.
+- Language-specific dimensions are selected when a dimension is cumulatively selected stably in one language and below `--specific_tau_low` in the others.
 - The script uses a fallback of at least one shared neuron per layer to keep the experiment runnable; check `selection_summary.csv` to ensure this fallback is not dominating.
+
+
+## Official SIREN selection rule used here
+
+For each trained L1 probe, the script computes:
+
+```python
+weights = abs(probe.weight)
+order = argsort(weights)[::-1]
+selected = order[:k]
+```
+
+where `k` is the smallest prefix such that:
+
+```text
+sum(weights[selected]) >= saliency_threshold * sum(weights)
+```
+
+This mirrors the official `select_salient_neurons(probe, threshold)` logic in CSSLab/SIREN.

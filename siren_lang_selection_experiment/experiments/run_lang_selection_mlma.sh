@@ -33,6 +33,7 @@ python experiments/lang_selection_siren_mlma.py \
   --extract_batch_size 16 \
   --seeds 1 2 3 \
   --c_values 50 100 200 \
+  --saliency_thresholds 0.6 0.8 \
   --stability_tau 0.6 \
   --specific_tau_low 0.3 \
   --mlp_hidden_dims 512 256 \

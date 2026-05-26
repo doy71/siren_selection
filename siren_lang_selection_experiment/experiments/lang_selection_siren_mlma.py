@@ -22,9 +22,10 @@ or a compatible fork such as real_siren, then run as:
     --hf_dataset <YOUR_MLMA_HF_DATASET_ID> \
     --text_column text --label_column label --language_column language \
     --languages en ko fr \
-    --pooling_type residual_mean \
+    --pooling_types residual_mean \
     --output_dir outputs/mlma_lang_selection_qwen \
-    --seeds 1 2 3
+    --seeds 1 2 3 \
+    --saliency_thresholds 0.6 0.8
 
 Notes
 -----
@@ -33,7 +34,10 @@ Notes
    dimensions across layers, and trains an MLP classifier on top.
 2. This script keeps that structure, but changes the selection source and retrains
    a fresh SIREN classifier for each selection strategy.
-3. `nonzero` selection is kept by default: abs(weight) > --nonzero_eps.
+3. Final selection now follows the official SIREN implementation: sort dimensions
+   by abs(probe weight), then keep the smallest prefix whose cumulative
+   importance reaches --saliency_threshold. Nonzero counts are kept only as
+   diagnostics, not as the selected neuron mask.
 
 Expected repo imports
 ---------------------
@@ -609,7 +613,7 @@ def train_selection_probes(args: argparse.Namespace, all_reps: Dict[str, Any], o
                     print(
                         f"    seed={seed}: "
                         f"val_f1={val_f1:.4f} test_f1={test_f1:.4f} "
-                        f"C={best_C} nonzero={len(nz)}/{weights_abs.shape[0]}"
+                        f"C={best_C} nonzero_diag={len(nz)}/{weights_abs.shape[0]}"
                     )
                     # Explicit cleanup to avoid GPU memory accumulation across
                     # the many (layer, source, seed) iterations.
@@ -632,14 +636,65 @@ def group_probe_runs(probe_runs: List[ProbeRun], pooling_type: str) -> Dict[Tupl
     return grouped
 
 
-def frequency_mask(runs: List[ProbeRun], tau: float, hidden_dim: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, float]:
+def select_by_cumulative_importance(weights_abs: np.ndarray, threshold: float) -> np.ndarray:
+    """Official SIREN-style salient-neuron selection.
+
+    The official training script does not use exact nonzero weights as the final
+    selected-neuron set.  It sorts dimensions by |probe weight| and keeps the
+    smallest prefix whose cumulative importance reaches ``threshold`` times the
+    total importance.  This function mirrors that behaviour.
+
+    Args:
+        weights_abs: absolute probe weights, shape [hidden_dim].
+        threshold: cumulative importance ratio, usually 0.6 or 0.8.
+
+    Returns:
+        int64 indices of selected dimensions.
+    """
+    weights_abs = np.asarray(weights_abs, dtype=np.float64)
+    if weights_abs.ndim != 1:
+        raise ValueError(f"weights_abs must be 1-D, got shape={weights_abs.shape}")
+    if len(weights_abs) == 0:
+        return np.array([], dtype=np.int64)
+
+    threshold = float(threshold)
+    if not (0.0 < threshold <= 1.0):
+        raise ValueError(f"--saliency_threshold must be in (0, 1], got {threshold}")
+
+    total = float(np.sum(weights_abs))
+    if total <= 0.0 or not np.isfinite(total):
+        # Degenerate probe; keep one dimension so downstream aggregation remains valid.
+        return np.array([int(np.argmax(weights_abs))], dtype=np.int64)
+
+    order = np.argsort(weights_abs)[::-1]
+    cumsum = np.cumsum(weights_abs[order])
+    cutoff = threshold * total
+    k = int(np.searchsorted(cumsum, cutoff, side="left")) + 1
+    k = max(1, min(k, len(order)))
+    return order[:k].astype(np.int64)
+
+
+def frequency_mask(
+    runs: List[ProbeRun],
+    tau: float,
+    saliency_threshold: float,
+    hidden_dim: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Compute stable selection frequency using official cumulative selection.
+
+    For each seed/run, a dimension counts as selected only if it belongs to that
+    run's cumulative-importance selected set.  Exact nonzero weights are *not*
+    used for final selection; they remain available as diagnostics through
+    ``ProbeRun.nonzero_indices``.
+    """
     if not runs:
         raise ValueError("No probe runs")
     if hidden_dim is None:
         hidden_dim = runs[0].weights_abs.shape[0]
     freq = np.zeros(hidden_dim, dtype=np.float32)
     for r in runs:
-        freq[r.nonzero_indices] += 1.0
+        selected_indices = select_by_cumulative_importance(r.weights_abs, saliency_threshold)
+        freq[selected_indices] += 1.0
     freq /= float(len(runs))
     selected = np.flatnonzero(freq >= tau).astype(np.int64)
     if len(selected) == 0:
@@ -679,7 +734,7 @@ def build_selection_masks(
 
     standard_masks[strategy][key] = selected neuron indices for key='layer{idx}_{pooling_type}'
     layer_weights[strategy][layer_idx] = performance-derived layer weight.
-    metadata contains frequencies and language-specific components.
+    metadata contains cumulative-selection frequencies and language-specific components.
     """
     grouped = group_probe_runs(probe_runs, pooling_type)
     langs = [normalize_lang(l) for l in args.languages]
@@ -687,7 +742,7 @@ def build_selection_masks(
     layer_weights: Dict[str, Dict[int, float]] = {}
     metadata: Dict[str, Any] = {"freq": {}, "specific": {}, "shared": {}}
 
-    # Per-source stable nonzero masks.
+    # Per-source stable cumulative-importance masks.
     for source in langs + ["pooled"]:
         source_masks: Dict[str, np.ndarray] = {}
         scores: Dict[int, float] = {}
@@ -695,7 +750,7 @@ def build_selection_masks(
             runs = grouped.get((source, layer_idx), [])
             if not runs:
                 continue
-            selected, freq, val_score = frequency_mask(runs, args.stability_tau)
+            selected, freq, val_score = frequency_mask(runs, args.stability_tau, args.saliency_threshold)
             key = f"layer{layer_idx}_{pooling_type}"
             source_masks[key] = selected
             scores[layer_idx] = val_score
@@ -1352,11 +1407,21 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1e-4,
         help=(
-            "Threshold for treating an L1-probe weight as nonzero. "
-            "The default 1e-4 is intentionally conservative: numerical noise "
-            "from the solver can leave near-zero weights that are not truly "
-            "selected. Increase towards 1e-3 if too many neurons pass. "
-            "The original value of 1e-8 is effectively no threshold."
+            "Diagnostic threshold for counting approximately nonzero L1-probe weights. "
+            "This is NOT used for final SIREN neuron selection. Final selection uses "
+            "--saliency_thresholds, matching the official cumulative-importance rule."
+        ),
+    )
+    parser.add_argument(
+        "--saliency_thresholds",
+        type=float,
+        nargs="+",
+        default=[0.6, 0.8],
+        help=(
+            "Official SIREN-style cumulative importance thresholds. For each probe, "
+            "dimensions are sorted by abs(weight), and the smallest prefix whose "
+            "cumulative importance reaches this ratio is selected. Official SIREN "
+            "commonly evaluates 0.6 and 0.8."
         ),
     )
     parser.add_argument("--stability_tau", type=float, default=0.60)
@@ -1387,6 +1452,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     args.languages = [normalize_lang(l) for l in args.languages]
+    for th in args.saliency_thresholds:
+        if not (0.0 < float(th) <= 1.0):
+            raise ValueError(f"All --saliency_thresholds must be in (0, 1], got {th}")
     output_dir = ensure_dir(args.output_dir)
     with open(output_dir / "args.json", "w") as f:
         json.dump(vars(args), f, indent=2, ensure_ascii=False)
@@ -1416,18 +1484,26 @@ def main() -> None:
 
     all_pooling_results = {}
     for pooling_type in args.pooling_types:
-        pooling_out = ensure_dir(output_dir / pooling_type)
-        masks, layer_weights, metadata = build_selection_masks(
-            args, probe_runs, pooling_type, all_reps["train"]["num_layers"]
-        )
-        write_selection_and_overlap_summaries(pooling_out, masks, layer_weights, metadata, pooling_type, args.languages)
-        results = train_and_eval_all_strategies(
-            args, all_reps, masks, layer_weights, metadata, pooling_type, pooling_out
-        )
-        write_results_csv(pooling_out, results)
-        with open(pooling_out / "classifier_results.json", "w") as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
-        all_pooling_results[pooling_type] = results
+        all_pooling_results[pooling_type] = {}
+        for saliency_threshold in args.saliency_thresholds:
+            # build_selection_masks reads args.saliency_threshold. Keep it explicit
+            # so cached probe weights can be reused across multiple thresholds.
+            args.saliency_threshold = float(saliency_threshold)
+            threshold_name = f"saliency_{float(saliency_threshold):.2f}".replace(".", "p")
+            pooling_out = ensure_dir(output_dir / pooling_type / threshold_name)
+            print(f"\n[selection] pooling={pooling_type}, saliency_threshold={args.saliency_threshold}")
+
+            masks, layer_weights, metadata = build_selection_masks(
+                args, probe_runs, pooling_type, all_reps["train"]["num_layers"]
+            )
+            write_selection_and_overlap_summaries(pooling_out, masks, layer_weights, metadata, pooling_type, args.languages)
+            results = train_and_eval_all_strategies(
+                args, all_reps, masks, layer_weights, metadata, pooling_type, pooling_out
+            )
+            write_results_csv(pooling_out, results)
+            with open(pooling_out / "classifier_results.json", "w") as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+            all_pooling_results[pooling_type][threshold_name] = results
 
     with open(output_dir / "all_results.json", "w") as f:
         json.dump(all_pooling_results, f, indent=2, ensure_ascii=False)
